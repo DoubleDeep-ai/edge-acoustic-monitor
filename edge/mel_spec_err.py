@@ -1,152 +1,157 @@
-import pyaudio
-import numpy as np
-import matplotlib.pyplot as plt
-import cv2
-import librosa.display
-from micro_Stream import MicrophoneStream
-import threading
-import socket
-import pickle
-import struct
-import pandas as pd
-from matplotlib import animation
+"""Raspberry Pi acoustic monitor and TCP client.
+
+Run with ``--simulate`` to exercise the complete data path without a microphone
+or camera. Real mode uses PyAudio for the microphone and OpenCV for the camera.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from datetime import datetime, timezone
+from io import BytesIO
+import math
 import random
+import socket
 import time
+from typing import Any, Iterator, Optional
 
-# 오디오 파라미터
-RATE = 16000
-CHUNK = int(RATE / 10)  # 100ms
+import numpy as np
+from PIL import Image, ImageDraw
 
-# 데이터 전송 플래스
-AUDIO_FLAG = False
+from common.protocol import send_packet
 
-# CSV 파일 경로
-csv_file_path = './datasets/test.csv'
-# CSV 파일 읽기
-df = pd.read_csv(csv_file_path)
-df = df['AccX']
-time_num = 0
-# 웹캠 인자
-WEBCAM_INDEX = 0  
-webcam_capture = cv2.VideoCapture(WEBCAM_INDEX)
-clientsocket=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-clientsocket.connect(('192.168.0.107',8089))
 
-tempersocket=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-tempersocket.connect(('192.168.0.107',8090))
+SAMPLE_RATE = 16_000
+CHUNK_SAMPLES = SAMPLE_RATE // 10
+WINDOW_SAMPLES = 10_240
 
-def plot_audio_and_mel_spectrogram(audio_gen):
-    global AUDIO_FLAG
-    full_frame = []
-    CHUNK = 1024
 
-    # 서브플롯 설정
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(10, 10))
-    plt.subplots_adjust(hspace=0.5)
-    thread_1 = threading.Thread(target = streaming)
-    thread_1.start()
-    # 데이터 전송 스레드 시작
-    send_thread = threading.Thread(target=send_data_thread)
-    send_thread.start()
-    max_points = 100
-    line, = ax4.plot(np.linspace(1, 10, max_points),
-                    np.linspace(-10, 10, max_points), lw=1, c='purple', ms=1)
-    
-    anim = animation.FuncAnimation(fig, animate, fargs=(line,))
-    for i, x in enumerate(audio_gen):
-        x = np.frombuffer(x, np.int16)
-        full_frame.append(x)
-        str_frame = b''.join(full_frame)
-        wav = np.frombuffer(str_frame, np.int16)
+def read_temperature() -> float:
+    """Return a demonstration value; replace this function for a DHT11 sensor."""
+    return round(random.uniform(20.0, 25.0), 1)
 
-        # 첫 번째 그래프 (상단 - 기본)
-        ax1.cla()
-        ax1.axis([0, CHUNK * 10, -8000, 8000])
-        try:
-            ax1.plot(wav[-CHUNK * 10:])
-        except:
-            ax1.plot(wav)
 
-        # 두 번째 그래프 (하단, mel-spectrogram)
-        ax2.cla()
-        # 여기에서 원하는 y 축의 범위를 지정
-        y_axis_range = [-20, 20000]
-        ax2.axis([0, CHUNK/100, y_axis_range[0], y_axis_range[1]])
-        try:
-            mel_spectrogram = librosa.feature.melspectrogram(y=wav[-CHUNK * 230:].astype(float), sr=RATE, n_fft=1600)
-            display_data = librosa.power_to_db(mel_spectrogram, ref=np.max)
-            # print('display_data : ',display_data)
-            librosa.display.specshow(display_data, y_axis='mel', x_axis='time', ax=ax2)
-        except Exception as e:
-            print(f"Error during spectrogram calculation: {e}")        
-        # 네 번째 그래프 (이상치 탐지)
-        ax3.cla()
-        ax3.axis([0, CHUNK * 10, -8000, 8000])
-        threshold = 5000
-        wav_plot = np.clip(wav[-CHUNK * 10:], -threshold, threshold)
-        ax3.plot(wav_plot, color='blue')
-        # 범위를 벗어나는 값은 빨간색으로 표시
-        exceed_indices = np.where(np.abs(wav[-CHUNK * 10:]) > threshold)[0]
-        str_ = 'Number of Outliers : ' + str(len(exceed_indices))
-        ax3.text(0.2, 0.8, str_, transform=ax3.transAxes)
-        ax3.plot(exceed_indices, wav_plot[exceed_indices], 'rx')
-        if (len(exceed_indices) >= 1000) and thread_1.is_alive():
-            print("이상치 탐지됨")
-            AUDIO_FLAG = True
+def synthetic_audio() -> Iterator[np.ndarray]:
+    """Yield normal and high-amplitude periods for the hardware-free demo."""
+    rng = np.random.default_rng(42)
+    while True:
+        phase = time.monotonic() % 10
+        scale = 8_000 if 6 <= phase < 8 else 900
+        yield rng.normal(0, scale, CHUNK_SAMPLES).clip(-32_768, 32_767).astype(np.int16)
+        time.sleep(CHUNK_SAMPLES / SAMPLE_RATE)
+
+
+def microphone_audio() -> Iterator[np.ndarray]:
+    from edge.micro_Stream import MicrophoneStream
+
+    with MicrophoneStream(SAMPLE_RATE, CHUNK_SAMPLES) as stream:
+        for chunk in stream.generator():
+            yield np.frombuffer(chunk, dtype=np.int16)
+
+
+class AudioDetector:
+    def __init__(self, amplitude_threshold: int, exceedance_count: int):
+        chunk_count = math.ceil(WINDOW_SAMPLES / CHUNK_SAMPLES)
+        self.chunks: deque[np.ndarray] = deque(maxlen=chunk_count)
+        self.amplitude_threshold = amplitude_threshold
+        self.exceedance_count = exceedance_count
+
+    def update(self, chunk: np.ndarray) -> tuple[bool, int, float]:
+        self.chunks.append(chunk)
+        window = np.concatenate(tuple(self.chunks))[-WINDOW_SAMPLES:]
+        exceedances = int(np.count_nonzero(np.abs(window.astype(np.int32)) > self.amplitude_threshold))
+        rms = float(np.sqrt(np.mean(window.astype(np.float64) ** 2)))
+        return exceedances >= self.exceedance_count, exceedances, round(rms, 1)
+
+
+class FrameSource:
+    def __init__(self, camera_index: int, simulate: bool):
+        self.capture: Optional[Any] = None
+        self.cv2: Optional[Any] = None
+        if not simulate:
+            import cv2
+
+            self.cv2 = cv2
+            self.capture = cv2.VideoCapture(camera_index)
+            if not self.capture.isOpened():
+                raise RuntimeError(f"could not open camera index {camera_index}")
+
+    def read(self, device_id: str, anomaly: bool, temperature: float, rms: float) -> Image.Image:
+        if self.capture is not None:
+            ok, frame = self.capture.read()
+            if not ok or frame is None:
+                raise RuntimeError("camera frame could not be read")
+            assert self.cv2 is not None
+            image = Image.fromarray(self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB))
         else:
-            AUDIO_FLAG = False
-        plt.pause(0.01)
-    anim.save()
-    #plt.show()
-    
-    
-def animate(i,line):
-    global time_num
-    y_2 = df.loc[time_num]
-    old_y_2 = line.get_ydata()
-    new_y_2 = np.r_[old_y_2[1:], y_2]
-    line.set_ydata(new_y_2)
-    #print(new_y_2)
-    time_num += 1
-    return line
+            image = Image.new("RGB", (640, 360), (28, 33, 43))
 
-def send_data_thread():
-    global df
-    while True:
-        try:
-            # 18과 30 사이의 랜덤한 값을 생성
-            random_value = random.uniform(18, 30)
-                # 데이터 전송
-            tempersocket.sendall(f"1. Temperature:{random_value}".encode())
-            # 1초 대기
-            time.sleep(1)
-        except Exception as e:
-            print(f"Error in send_data_thread: {e}")
-            break
+        status = "ANOMALY" if anomaly else "NORMAL"
+        color = (230, 70, 70) if anomaly else (65, 190, 90)
+        draw = ImageDraw.Draw(image)
+        if self.capture is None:
+            draw.text((34, 45), "SIMULATED EDGE CAMERA", fill=(235, 235, 235))
+        draw.rectangle((24, image.height - 110, image.width - 24, image.height - 20), fill=(18, 18, 18))
+        draw.text((42, image.height - 82), f"{device_id}  {status}", fill=color)
+        draw.text((42, image.height - 48), f"Temperature {temperature:.1f} C   Audio RMS {rms:.0f}", fill=(230, 230, 230))
+        return image
 
-def streaming():
-    # 비디오 경로 읽어오기
-    while True:
-        ret,frame=webcam_capture.read()
-        # 프레임 직렬화하여 전송준비
-        # 이미지 데이터와 추가 데이터를 함께 전송
-        additional_data = ''
-        if AUDIO_FLAG:
-            additional_data = "1번기계에서 이상값이 발견되었습니다"
-            # 이미지 데이터와 추가 데이터를 함께 전송
-        data = pickle.dumps((frame, additional_data))
-        # 메시지 길이 측정
-        message_size = struct.pack("L", len(data))
-        # 데이터 전송
-        clientsocket.sendall(message_size + data)
+    def close(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
 
-def main():
-    plt.ion()
-    with MicrophoneStream(RATE, CHUNK) as stream:
-        audio_generator = stream.generator()
-        plot_audio_and_mel_spectrogram(audio_generator)
-        print(list(audio_generator))
 
-if __name__ == '__main__':
-    main()
-    print("end main")
+def encode_jpeg(frame: Image.Image, quality: int) -> bytes:
+    output = BytesIO()
+    frame.save(output, format="JPEG", quality=quality)
+    return output.getvalue()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Edge acoustic monitoring client")
+    parser.add_argument("--host", default="127.0.0.1", help="monitoring server address")
+    parser.add_argument("--port", type=int, default=8089, help="monitoring server port")
+    parser.add_argument("--device-id", default="machine-1", help="device label shown on the dashboard")
+    parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
+    parser.add_argument("--threshold", type=int, default=5_000, help="absolute audio amplitude threshold")
+    parser.add_argument("--exceedance-count", type=int, default=1_000, help="samples above threshold required for an alert")
+    parser.add_argument("--jpeg-quality", type=int, default=75, choices=range(30, 96), metavar="30-95")
+    parser.add_argument("--simulate", action="store_true", help="use generated audio and video")
+    return parser.parse_args()
+
+
+def run(args: argparse.Namespace) -> None:
+    detector = AudioDetector(args.threshold, args.exceedance_count)
+    frames = FrameSource(args.camera, args.simulate)
+    audio = synthetic_audio() if args.simulate else microphone_audio()
+
+    print(f"Connecting {args.device_id} to {args.host}:{args.port}")
+    try:
+        with socket.create_connection((args.host, args.port), timeout=10) as client:
+            client.settimeout(None)
+            for chunk in audio:
+                anomaly, exceedances, rms = detector.update(chunk)
+                temperature = read_temperature()
+                frame = frames.read(args.device_id, anomaly, temperature, rms)
+                metadata = {
+                    "device_id": args.device_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "anomaly": anomaly,
+                    "exceedances": exceedances,
+                    "audio_rms": rms,
+                    "temperature": temperature,
+                    "simulated": args.simulate,
+                }
+                send_packet(client, metadata, encode_jpeg(frame, args.jpeg_quality))
+    finally:
+        frames.close()
+
+
+if __name__ == "__main__":
+    try:
+        run(parse_args())
+    except KeyboardInterrupt:
+        print("\nEdge client stopped")
+    except (ConnectionError, OSError, RuntimeError, ValueError) as error:
+        raise SystemExit(f"Edge client error: {error}") from error

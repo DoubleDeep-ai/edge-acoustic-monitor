@@ -1,227 +1,194 @@
-import tkinter as tk
-import threading
-import pandas as pd
-import cv2
+"""Thread-safe Tkinter dashboard for edge monitoring nodes."""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict, deque
+from datetime import datetime
+from io import BytesIO
+import queue
 import socket
-import struct
-from PIL import Image, ImageTk
-import pickle
+import threading
+import tkinter as tk
 from tkinter import ttk
-import time
-import numpy as np
+from typing import Any, Optional
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from PIL import ImageDraw, ImageFont
+from PIL import Image, ImageTk
 
-HOST = 'localhost'
-PORT = 8089
+from common.protocol import ConnectionClosed, receive_packet
 
-DATA_HOST = 'localhost'
-DATA_PORT = 8090
 
-class VideoServer:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Video Server")
-        self.status_label = tk.Label(self.root, text="Server not connected", font=("Helvetica", 14))
-        self.status_label.pack(pady=10)
-        self.root.geometry("1200x800+200+200")
-        
-        self.start_button = tk.Button(self.root, text="Start Server", command=self.start_server)
-        self.start_button.pack(pady=10)
+class MonitoringDashboard:
+    def __init__(self, root: tk.Tk, host: str, port: int):
+        self.root = root
+        self.host = host
+        self.port = port
+        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.server_socket: Optional[socket.socket] = None
+        self.frame_labels: dict[str, tk.Label] = {}
+        self.frame_images: dict[str, ImageTk.PhotoImage] = {}
+        self.temperature_history: defaultdict[str, deque[float]] = defaultdict(lambda: deque(maxlen=100))
+        self.alert_state: defaultdict[str, bool] = defaultdict(bool)
 
-        # 프레임을 저장하는 리스트
-        self.frames = []
-        # 그래프 출력
-        plt.rcParams.update({'font.size': 4})
-        self.fig, self.ax = plt.subplots(figsize=(6, 1.2))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas_widget = self.canvas.get_tk_widget()
+        self.root.title("Edge Acoustic Monitor")
+        self.root.geometry("1180x820")
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.x_data = np.arange(0, 10, 0.1)
-        self.y_data = np.zeros_like(self.x_data)
+        header = ttk.Frame(root, padding=12)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Edge Acoustic Monitor", font=("Helvetica", 18, "bold")).pack(side=tk.LEFT)
+        self.status = ttk.Label(header, text="Server stopped")
+        self.status.pack(side=tk.LEFT, padx=20)
+        self.start_button = ttk.Button(header, text="Start server", command=self.start)
+        self.start_button.pack(side=tk.RIGHT)
 
-        # 일정 간격으로 그래프 업데이트 호출
-        #self.root.after(100, self.update_plot)
+        self.video_area = ttk.LabelFrame(root, text="Live devices", padding=10)
+        self.video_area.pack(fill=tk.X, padx=12, pady=6)
 
-        # Treeview로 테이블 생성
-        self.table = tk.Frame(self.root)
-        self.tree = ttk.Treeview(self.table)
-        self.tree["columns"] = ("Client ID", "Additional Data","Time")
-        self.tree.column("#0", width=0, stretch=tk.NO)  # 숨김 열
-        self.tree.column("Client ID", anchor=tk.CENTER, width=300)
-        self.tree.column("Additional Data", anchor=tk.W, width=400)
-        self.tree.column("Time", anchor=tk.CENTER, width=300)
+        self.figure, self.axis = plt.subplots(figsize=(8, 2.2))
+        self.axis.set_title("Temperature history")
+        self.axis.set_ylabel("°C")
+        self.axis.set_ylim(15, 35)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=root)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
 
-        self.tree.heading("#0", text="", anchor=tk.W)
-        self.tree.heading("Client ID", text="Client ID", anchor=tk.CENTER)
-        self.tree.heading("Additional Data", text="Additional Data", anchor=tk.W)
-        
-        self.tree.heading("Time", text="Time", anchor=tk.CENTER)
-        self.scrollbar = ttk.Scrollbar(self.table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=self.scrollbar.set)
-        # 트리뷰와 스크롤바 배치
-        
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH,padx=100)
-        self.scrollbar.pack(side='right', fill='y')
-        # 윈도우 크기 조정에 따라 테이블 크기 변경
-        self.table.pack(side=tk.BOTTOM,fill=tk.BOTH,pady=10)
-        self.canvas_widget.pack(side=tk.BOTTOM,padx=100,pady=20)
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
-        # 배경 색을 변경할 태그 생성
-        self.tree.tag_configure("green_row", background="#FF0000")  # 예시 색상 (연두색)
-        self.tree.tag_configure("yellow_row", background="#0000FF")  # 예시 색상 (노란색)
-        
-        
-    def update_plot(self):
-        # 여기에서 실제로 그래프를 업데이트하는 로직을 추가
-        self.ax.clear()
-        self.x_data += 0.1
-        self.line, = self.ax.plot(self.x_data, self.y_data)
+        event_frame = ttk.LabelFrame(root, text="Anomaly events", padding=8)
+        event_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+        self.event_table = ttk.Treeview(event_frame, columns=("device", "message", "time"), show="headings", height=7)
+        self.event_table.heading("device", text="Device")
+        self.event_table.heading("message", text="Message")
+        self.event_table.heading("time", text="Received at")
+        self.event_table.column("device", width=180)
+        self.event_table.column("message", width=600)
+        self.event_table.column("time", width=200)
+        scrollbar = ttk.Scrollbar(event_frame, orient=tk.VERTICAL, command=self.event_table.yview)
+        self.event_table.configure(yscrollcommand=scrollbar.set)
+        self.event_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 그래프 범위 설정
-        self.ax.set_ylim([18, 30])
-        
-        # 다음 업데이트를 예약
-        self.canvas.draw()
-        #self.root.after(2000, self.update_plot)
-        self.ax.clear()
-        
+        self.root.after(50, self.process_events)
 
-        
-        
-    def start_server(self):
-        self.start_button.config(state="disabled")
-        self.status_label.config(text="Waiting for connection...")
-        server_thread = threading.Thread(target=self.receive_video, daemon=True)
-        server_thread.start()
-        server_data_thread = threading.Thread(target=self.receive_temper, daemon=True)
-        server_data_thread.start()
-            
-    def receive_video(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind((HOST, PORT))
-        s.listen(10)
-        print(f"Server listening on {HOST}:{PORT}")
+    def start(self) -> None:
+        self.start_button.configure(state=tk.DISABLED)
+        threading.Thread(target=self.accept_connections, daemon=True).start()
 
-        while True:
-            conn, addr = s.accept()
-            print(f"Connection from {addr}")
-
-            # 클라이언트 식별에 IP 주소와 포트 번호 모두 사용
-            client_id = f"{addr[0]}:{addr[1]}"
-
-            # 클라이언트에 대한 레이블 생성
-            client_label = tk.Label(self.root)
-            client_label.pack(side="left", padx=10)
-            
-            # 새로운 클라이언트에 대한 레이블을 리스트에 추가
-            self.frames.append({
-                'client_id': client_id,
-                'label': client_label
-            })
-
-            # 새로운 클라이언트에 대해 스레드를 생성하여 영상 수신 및 표시
-            client_thread = threading.Thread(target=self.receive_and_display, args=(conn, client_id), daemon=True)
-            client_thread.start()
-            
-    def receive_temper(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind((DATA_HOST, DATA_PORT))
-        print(f"Server listening on data -> {DATA_HOST}:{DATA_PORT}")
-        s.listen(10)
-        while True:
-            conn, addr = s.accept()
-            print(f"Connection from {addr}")
-
-            # 클라이언트 식별에 IP 주소와 포트 번호 모두 사용
-            client_id = f"{addr[0]}:{addr[1]}"
-            # 새로운 클라이언트에 대해 스레드를 생성하여 영상 수신 및 표시
-            client_thread = threading.Thread(target=self.receive_data, args=(conn, client_id), daemon=True)
-            client_thread.start()
-
-    def receive_data(self, conn, client_id):
+    def accept_connections(self) -> None:
         try:
-            while True:
-                # 클라이언트로부터 데이터를 받음
-                data = conn.recv(1024)
-                data = data.decode()
-                if not data:
-                    break  # 클라이언트가 연결을 종료하면 루프를 종료
-                # 받은 데이터를 처리 (여기에서는 간단하게 출력)
-                print(f"Received data from client: {data}")
-                temperature_str = data.split("Temperature:")[1].strip()
-                temperature = float(temperature_str)
-                self.y_data = np.append(self.y_data[1:],temperature)
-                self.update_plot()
-        except Exception as e:
-            print(f"Error in server: {e}")
-        finally:
-            # 클라이언트 소켓 종료
-            conn.close()
-            
-        
-    def receive_and_display(self, conn, client_id):
-        payload_size = struct.calcsize("L")
-        data = b''
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
+            server.listen(10)
+            server.settimeout(0.5)
+            self.server_socket = server
+            self.events.put(("status", f"Listening on {self.host}:{self.port}"))
 
+            while not self.stop_event.is_set():
+                try:
+                    connection, address = server.accept()
+                except socket.timeout:
+                    continue
+                connection.settimeout(10)
+                threading.Thread(target=self.receive_client, args=(connection, address), daemon=True).start()
+        except OSError as error:
+            self.events.put(("error", f"Server error: {error}"))
+
+    def receive_client(self, connection: socket.socket, address: tuple[str, int]) -> None:
+        peer = f"{address[0]}:{address[1]}"
+        self.events.put(("status", f"Connected: {peer}"))
+        try:
+            with connection:
+                while not self.stop_event.is_set():
+                    packet = receive_packet(connection)
+                    if packet is None:
+                        break
+                    metadata, image = packet
+                    self.events.put(("packet", (metadata, image)))
+        except (ConnectionClosed, OSError, ValueError) as error:
+            self.events.put(("status", f"Disconnected: {peer} ({error})"))
+        else:
+            self.events.put(("status", f"Disconnected: {peer}"))
+
+    def process_events(self) -> None:
         while True:
-            while len(data) < payload_size:
-                data += conn.recv(4096)
-            packed_msg_size = data[:payload_size]
-            data = data[payload_size:]
-            msg_size = struct.unpack("L", packed_msg_size)[0]
-            while len(data) < msg_size:
-                data += conn.recv(4096)
-            frame_data = data[:msg_size]
-            data = data[msg_size:]
-            #frame = pickle.loads(frame_data)
-            frame, additional_data = pickle.loads(frame_data)
-            # 추가 데이터가 있는 경우에만 테이블에 행 추가
-            if additional_data:
-                self.add_row_to_table(client_id, additional_data)
+            try:
+                event_type, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
 
-            # 이미지를 PhotoImage로 변환
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            text_to_add = f"Client: {client_id}"  # 변경 가능
-            resized_img = self.resize_image(img, 300, 200)
-            self.add_text_to_image(resized_img, text_to_add)
-            img_tk = ImageTk.PhotoImage(resized_img)
-            # 텍스트를 이미지에 추가
-            
-            
+            if event_type == "packet":
+                self.update_packet(*payload)
+            elif event_type == "error":
+                self.status.configure(text=payload, foreground="#b3261e")
+                self.start_button.configure(state=tk.NORMAL)
+            else:
+                self.status.configure(text=payload)
 
-            # 클라이언트에 해당하는 레이블을 찾아 업데이트
-            for frame_info in self.frames:
-                if frame_info['client_id'] == client_id:
-                    frame_info['label'].configure(image=img_tk,width=300, height=200)
-                    frame_info['label'].image = img_tk
-                    self.root.update_idletasks()
-                    break
-                
-    def add_text_to_image(self, image, text, position=(10, 10), font_size=20, font_color=(255, 255, 255)):
-        # 이미지에 텍스트 추가
-        draw = ImageDraw.Draw(image)
-        font = ImageFont.load_default()  # 기본 폰트 사용 (원하는 폰트로 변경 가능)
-        draw.text(position, text, font=font, fill=font_color)
-        
-    
-    def add_row_to_table(self, client_id, additional_data):
-        now = time
-        tag = "green_row" if additional_data == "1번기계에서 이상값이 발견되었습니다" else "yellow_row"
-        # 테이블에 새로운 행 추가
-        self.tree.insert("", "end", values=(client_id, additional_data,now.strftime('%Y-%m-%d %H:%M:%S')),tags=tag)
-        
-        
-    def run(self):
-        self.root.mainloop()
-    
-    # 이미지 크기 조절 함수
-    def resize_image(self, image, new_width, new_height):
-        return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        self.root.after(50, self.process_events)
 
-if __name__ == '__main__':
-    video_server = VideoServer()
-    video_server.run()
+    def update_packet(self, metadata: dict[str, Any], image_bytes: bytes) -> None:
+        device_id = str(metadata.get("device_id", "unknown-device"))
+        anomaly = bool(metadata.get("anomaly", False))
+        temperature = float(metadata.get("temperature", 0.0))
+        exceedances = int(metadata.get("exceedances", 0))
+
+        if image_bytes:
+            try:
+                with Image.open(BytesIO(image_bytes)) as frame:
+                    display = frame.convert("RGB").resize((360, 203), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(display)
+                label = self.frame_labels.get(device_id)
+                if label is None:
+                    panel = ttk.Frame(self.video_area)
+                    panel.pack(side=tk.LEFT, padx=8)
+                    ttk.Label(panel, text=device_id, font=("Helvetica", 11, "bold")).pack()
+                    label = ttk.Label(panel)
+                    label.pack()
+                    self.frame_labels[device_id] = label
+                label.configure(image=photo)
+                self.frame_images[device_id] = photo
+            except OSError:
+                self.status.configure(text=f"Invalid image from {device_id}", foreground="#b3261e")
+
+        self.temperature_history[device_id].append(temperature)
+        self.update_temperature_plot()
+
+        if anomaly and not self.alert_state[device_id]:
+            message = f"Large-amplitude audio detected ({exceedances:,} samples over threshold)"
+            self.event_table.insert("", 0, values=(device_id, message, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        self.alert_state[device_id] = anomaly
+
+    def update_temperature_plot(self) -> None:
+        self.axis.clear()
+        self.axis.set_title("Temperature history")
+        self.axis.set_ylabel("°C")
+        self.axis.set_ylim(15, 35)
+        for device_id, values in self.temperature_history.items():
+            self.axis.plot(list(values), label=device_id)
+        if self.temperature_history:
+            self.axis.legend(loc="upper right")
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.server_socket is not None:
+            self.server_socket.close()
+        plt.close(self.figure)
+        self.root.destroy()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Jetson Nano monitoring dashboard")
+    parser.add_argument("--host", default="0.0.0.0", help="address to bind")
+    parser.add_argument("--port", type=int, default=8089, help="TCP port")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    arguments = parse_args()
+    window = tk.Tk()
+    MonitoringDashboard(window, arguments.host, arguments.port)
+    window.mainloop()

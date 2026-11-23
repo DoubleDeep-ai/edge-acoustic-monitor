@@ -1,58 +1,56 @@
-import pyaudio
-import numpy as np
-import time
-import matplotlib.pyplot as plt
-import pyaudio
-from six.moves import queue
+"""Thread-safe PyAudio input stream used by the Raspberry Pi client."""
 
-class MicrophoneStream(object):
-    """Opens a recording stream as a generator yielding the audio chunks."""
-    def __init__(self, rate, chunk):
-        self._rate = rate
-        self._chunk = chunk
+from __future__ import annotations
 
-        # Create a thread-safe buffer of audio data
-        self._buff = queue.Queue()
+from queue import Empty, Queue
+from typing import Iterator, Optional
+
+import pyaudio
+
+
+class MicrophoneStream:
+    def __init__(self, rate: int, chunk: int):
+        self.rate = rate
+        self.chunk = chunk
+        self.buffer: Queue[Optional[bytes]] = Queue()
         self.closed = True
 
-    def __enter__(self):
-        self._audio_interface = pyaudio.PyAudio()
-        self._audio_stream = self._audio_interface.open(
+    def __enter__(self) -> "MicrophoneStream":
+        self.audio_interface = pyaudio.PyAudio()
+        self.audio_stream = self.audio_interface.open(
             format=pyaudio.paInt16,
-            channels=1, rate=self._rate,
-            input=True, frames_per_buffer=self._chunk,
+            channels=1,
+            rate=self.rate,
+            input=True,
+            frames_per_buffer=self.chunk,
             stream_callback=self._fill_buffer,
         )
-
         self.closed = False
-
         return self
 
-    def __exit__(self, type, value, traceback):
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.audio_stream.stop_stream()
+        self.audio_stream.close()
         self.closed = True
-        self._buff.put(None)
-        self._audio_interface.terminate()
+        self.buffer.put(None)
+        self.audio_interface.terminate()
 
-    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
-        """Continuously collect data from the audio stream, into the buffer."""
-        self._buff.put(in_data)
+    def _fill_buffer(self, data, frame_count, time_info, status_flags):
+        self.buffer.put(data)
         return None, pyaudio.paContinue
 
-    def generator(self):
+    def generator(self) -> Iterator[bytes]:
         while not self.closed:
-            chunk = self._buff.get()
+            chunk = self.buffer.get()
             if chunk is None:
                 return
-            data = [chunk]
+            chunks = [chunk]
             while True:
                 try:
-                    chunk = self._buff.get(block=False)
+                    chunk = self.buffer.get_nowait()
                     if chunk is None:
                         return
-                    data.append(chunk)
-                except queue.Empty:
+                    chunks.append(chunk)
+                except Empty:
                     break
-
-            yield b''.join(data)
+            yield b"".join(chunks)
